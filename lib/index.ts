@@ -68,6 +68,7 @@ export interface RedisAdapterOptions {
    */
   publishOnSpecificResponseChannel: boolean;
   /**
+   * 레디스에 보내고 받을때 인코딩, 디코딩에 사용
    * The parser to use for encoding and decoding messages sent to Redis.
    * This option defaults to using `notepack.io`, a MessagePack implementation.
    */
@@ -106,6 +107,9 @@ export class RedisAdapter extends Adapter {
   private requests: Map<string, Request> = new Map();
   private ackRequests: Map<string, AckRequest> = new Map();
   private redisListeners: Map<string, Function> = new Map();
+  // private redisClientList = new Array();
+  // private pubClient;
+  // private subClient;
 
   /**
    * Adapter constructor.
@@ -119,16 +123,23 @@ export class RedisAdapter extends Adapter {
    */
   constructor(
     nsp: any,
+    // readonly urlList: string[],
     readonly pubClient: any,
     readonly subClient: any,
     opts: Partial<RedisAdapterOptions> = {}
   ) {
     super(nsp);
 
+    // this.redisClientList = urlList.map((url) =>
+    //   createClient({ url: `redis://${url}` })
+    // );
+    // this.pubClient = this.redisClientList[0];
+    // this.subClient = this.redisClientList[0];
+
     this.uid = uid2(6);
     this.requestsTimeout = opts.requestsTimeout || 5000;
     this.publishOnSpecificResponseChannel = !!opts.publishOnSpecificResponseChannel;
-    this.parser = opts.parser || msgpack;
+    this.parser = opts.parser || msgpack; // 따로 parser 지정 없으면 msgpack 사용
 
     const prefix = opts.key || "socket.io";
 
@@ -137,21 +148,27 @@ export class RedisAdapter extends Adapter {
     this.responseChannel = prefix + "-response#" + this.nsp.name + "#";
     this.specificResponseChannel = this.responseChannel + this.uid + "#";
 
+    // 레디스 클라이언트인 경우
     const isRedisV4 = typeof this.pubClient.pSubscribe === "function";
     if (isRedisV4) {
+      // Map에 psub 키값으로 저장
       this.redisListeners.set("psub", (msg, channel) => {
         this.onmessage(null, channel, msg);
       });
 
+      // Map에 sub 키값으로 저장
       this.redisListeners.set("sub", (msg, channel) => {
         this.onrequest(channel, msg);
       });
 
+      // 레디스 패턴채널 구독 (patterns, listener, bufferMode)
       this.subClient.pSubscribe(
         this.channel + "*",
         this.redisListeners.get("psub"),
         true
       );
+
+      // 지정채널 메시지 구독 (patterns, listener, bufferMode)
       this.subClient.subscribe(
         [
           this.requestChannel,
@@ -162,26 +179,36 @@ export class RedisAdapter extends Adapter {
         true
       );
     } else {
+      // Map에 pmessageBuffer, messageBuffer 키값으로 저장
       this.redisListeners.set("pmessageBuffer", this.onmessage.bind(this));
       this.redisListeners.set("messageBuffer", this.onrequest.bind(this));
 
+      // 채널 패턴 구독
       this.subClient.psubscribe(this.channel + "*");
+
+      // EventEmitter.on()
+      // eventName, listener
+      // listener : 이벤트 이름으로 된 배열 끝에 리스너추가 (갖고있는지 체크안함 그냥 추가)
+      // pmessageBuffer 배열 끝에 리스너 추가
       this.subClient.on(
         "pmessageBuffer",
         this.redisListeners.get("pmessageBuffer")
       );
 
+      // 지정채널 메시지 구독 (patterns)
       this.subClient.subscribe([
         this.requestChannel,
         this.responseChannel,
         this.specificResponseChannel,
       ]);
+      // messageBuffer 배열 끝에 리스너 추가
       this.subClient.on(
         "messageBuffer",
         this.redisListeners.get("messageBuffer")
       );
     }
 
+    // 에러 핸들링
     const registerFriendlyErrorHandler = (redisClient) => {
       redisClient.on("error", () => {
         if (redisClient.listenerCount("error") === 1) {
@@ -196,22 +223,25 @@ export class RedisAdapter extends Adapter {
 
   /**
    * Called with a subscription message
-   *
+   * 구독 메시지 확인
    * @private
    */
   private onmessage(pattern, channel, msg) {
     channel = channel.toString();
 
+    // 채널 매칭 확인
     const channelMatches = channel.startsWith(this.channel);
     if (!channelMatches) {
       return debug("ignore different channel");
     }
 
+    // 방이 비었는지 확인
     const room = channel.slice(this.channel.length, -1);
     if (room !== "" && !this.hasRoom(room)) {
       return debug("ignore unknown room %s", room);
     }
 
+    // 레디스 메시지 디코드
     const args = this.parser.decode(msg);
 
     const [uid, packet, opts] = args;
@@ -227,9 +257,11 @@ export class RedisAdapter extends Adapter {
     opts.rooms = new Set(opts.rooms);
     opts.except = new Set(opts.except);
 
+    // socket.io-adapter의 broadcast 접근
     super.broadcast(packet, opts);
   }
 
+  // 룸을 가졌는가에 대한 체크
   private hasRoom(room): boolean {
     // @ts-ignore
     const hasNumericRoom = isNumeric(room) && this.rooms.has(parseFloat(room));
@@ -238,12 +270,13 @@ export class RedisAdapter extends Adapter {
 
   /**
    * Called on request from another node
-   *
+   * redis에 키 값 저장(set)할때 호출 함수 - 다른 노드 요청에 따라 호출
    * @private
    */
   private async onrequest(channel, msg) {
     channel = channel.toString();
 
+    // 찾는 채널이 있다면 메시지 수신
     if (channel.startsWith(this.responseChannel)) {
       return this.onresponse(channel, msg);
     } else if (!channel.startsWith(this.requestChannel)) {
@@ -274,13 +307,16 @@ export class RedisAdapter extends Adapter {
           return;
         }
 
+        // 소켓아이디별 리스트 조회
         const sockets = await super.sockets(new Set(request.rooms));
 
+        // 소켓 설정
         response = JSON.stringify({
           requestId: request.requestId,
           sockets: [...sockets],
         });
 
+        // 다른 요청 노드로 res 전달
         this.publishResponse(request, response);
         break;
 
@@ -289,6 +325,7 @@ export class RedisAdapter extends Adapter {
           return;
         }
 
+        // 룸 설정
         response = JSON.stringify({
           requestId: request.requestId,
           rooms: [...this.rooms.keys()],
@@ -303,20 +340,24 @@ export class RedisAdapter extends Adapter {
             rooms: new Set<Room>(request.opts.rooms),
             except: new Set<Room>(request.opts.except),
           };
+          // 특정 룸 들어감
           return super.addSockets(opts, request.rooms);
         }
 
+        // 소켓아이디로 소켓 찾기
         socket = this.nsp.sockets.get(request.sid);
         if (!socket) {
           return;
         }
 
+        // 룸 들어감
         socket.join(request.room);
 
         response = JSON.stringify({
           requestId: request.requestId,
         });
 
+        // 다른 요청 노드로 res 전달
         this.publishResponse(request, response);
         break;
 
@@ -326,6 +367,7 @@ export class RedisAdapter extends Adapter {
             rooms: new Set<Room>(request.opts.rooms),
             except: new Set<Room>(request.opts.except),
           };
+          // 특정 룸 나감
           return super.delSockets(opts, request.rooms);
         }
 
@@ -334,12 +376,14 @@ export class RedisAdapter extends Adapter {
           return;
         }
 
+        // 룸 나감
         socket.leave(request.room);
 
         response = JSON.stringify({
           requestId: request.requestId,
         });
 
+        // 다른 요청 노드로 res 전달
         this.publishResponse(request, response);
         break;
 
@@ -349,6 +393,7 @@ export class RedisAdapter extends Adapter {
             rooms: new Set<Room>(request.opts.rooms),
             except: new Set<Room>(request.opts.except),
           };
+          // 소켓 연결 종료
           return super.disconnectSockets(opts, request.close);
         }
 
@@ -357,6 +402,7 @@ export class RedisAdapter extends Adapter {
           return;
         }
 
+        // 소켓 연결 종료
         socket.disconnect(request.close);
 
         response = JSON.stringify({
@@ -375,6 +421,7 @@ export class RedisAdapter extends Adapter {
           rooms: new Set<Room>(request.opts.rooms),
           except: new Set<Room>(request.opts.except),
         };
+        // 매칭되는 소켓 찾기
         const localSockets = await super.fetchSockets(opts);
 
         response = JSON.stringify({
@@ -472,6 +519,7 @@ export class RedisAdapter extends Adapter {
   }
 
   /**
+   * redis.set() -> onrequest() -> publishResponse()
    * Send the response to the requesting node
    * @param request
    * @param response
@@ -482,12 +530,14 @@ export class RedisAdapter extends Adapter {
       ? `${this.responseChannel}${request.uid}#`
       : this.responseChannel;
     debug("publishing response to channel %s", responseChannel);
+
+    // 레디스에 메시지 전송
     this.pubClient.publish(responseChannel, response);
   }
 
   /**
    * Called on response from another node
-   *
+   * 다른 노드에서 메시지 받기
    * @private
    */
   private onresponse(channel, msg) {
